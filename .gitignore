@@ -86,3 +86,6 @@ logs/
 
 # --- Raw Data ---
 raw_datasets/
+
+# Cookies
+cookies.txt
