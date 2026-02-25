@@ -1,13 +1,28 @@
+import asyncio
 import hashlib
 import re
-import time
-import requests
 from pathlib import Path
 from urllib.parse import urlencode
 
+import httpx
 from bs4 import BeautifulSoup
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .models import CrawlConfig
+
+
+class RateLimitedError(Exception):
+    """Raised when a 429 or 5xx response is received."""
+
+    def __init__(self, status_code: int, retry_after: float | None = None):
+        self.status_code = status_code
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {status_code}")
 
 
 class GoogleImageCrawler:
@@ -47,13 +62,20 @@ class GoogleImageCrawler:
 
     def __init__(self, config: CrawlConfig):
         self.config = config
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": config.user_agent})
         self._output_path = Path(config.output_dir)
         self._output_path.mkdir(parents=True, exist_ok=True)
         self._downloaded = 0
         self._existing_hashes: set[str] = self._load_existing_hashes()
-        print(f"Found {len(self._existing_hashes)} existing image(s) in '{config.output_dir}', duplicates will be skipped.")
+        self._lock = asyncio.Lock()
+        self._limit_reached = asyncio.Event()
+        print(
+            f"Found {len(self._existing_hashes)} existing image(s) "
+            f"in '{config.output_dir}', duplicates will be skipped."
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers (unchanged logic)
+    # ------------------------------------------------------------------
 
     def _load_existing_hashes(self) -> set[str]:
         hashes: set[str] = set()
@@ -134,61 +156,172 @@ class GoogleImageCrawler:
             return ".webp"
         return ".jpg"
 
-    def _download_image(self, url: str) -> bool:
+    # ------------------------------------------------------------------
+    # Retry decorator factory
+    # ------------------------------------------------------------------
+
+    def _make_retry(self):
+        """Build a tenacity retry decorator from the current config."""
+        return retry(
+            retry=retry_if_exception_type(RateLimitedError),
+            stop=stop_after_attempt(self.config.max_retries),
+            wait=wait_exponential(
+                multiplier=1,
+                min=1,
+                max=30,
+                exp_base=self.config.backoff_base,
+            ),
+            reraise=True,
+        )
+
+    @staticmethod
+    def _check_response(resp: httpx.Response) -> None:
+        """Raise RateLimitedError on 429 / 5xx so tenacity can retry."""
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else None
+            if wait:
+                print(f"  ⚠ Rate-limited (429). Retry-After: {wait}s")
+            raise RateLimitedError(429, retry_after=wait)
+        if resp.status_code >= 500:
+            raise RateLimitedError(resp.status_code)
+
+    # ------------------------------------------------------------------
+    # Async network methods
+    # ------------------------------------------------------------------
+
+    async def _fetch_search_page(
+        self, client: httpx.AsyncClient, start: int
+    ) -> str | None:
+        """Fetch a single Google Image search page with retry."""
+        url = self._build_url(start)
+
+        @self._make_retry()
+        async def _inner():
+            resp = await client.get(url)
+            self._check_response(resp)
+            resp.raise_for_status()
+            return resp.text
+
         try:
-            resp = self.session.get(url, timeout=self.config.timeout)
-            if resp.status_code != 200:
-                return False
-            content_type = resp.headers.get("Content-Type", "")
-            if "image" not in content_type and not any(e in content_type for e in ["jpeg", "png", "gif", "webp"]):
-                return False
+            return await _inner()
+        except Exception as exc:
+            print(f"Error fetching search page (start={start}): {exc}")
+            return None
 
-            content = resp.content
-            content_hash = self._hash_content(content)
-
-            if content_hash in self._existing_hashes:
-                print(f"  Skipped (duplicate): {url[:60]}...")
-                return False
-
-            ext = self._get_extension(url, content_type)
-            filename = self._output_path / f"{content_hash}{ext}"
-            filename.write_bytes(content)
-
-            self._existing_hashes.add(content_hash)
-            self._downloaded += 1
-            print(f"[{self._downloaded}/{self.config.limit}] Saved: {filename.name}")
-            return True
-        except Exception as e:
-            print(f"  Failed: {url[:60]}... -> {e}")
+    async def _download_image(
+        self,
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        url: str,
+    ) -> bool:
+        """Download a single image, bounded by semaphore, with retry."""
+        if self._limit_reached.is_set():
             return False
 
-    def crawl(self) -> int:
-        print(f"Starting crawl: '{self.config.keyword}' | limit={self.config.limit}")
-        start = 0
-        collected_urls: list[str] = []
+        async with semaphore:
+            if self._limit_reached.is_set():
+                return False
 
-        while len(collected_urls) < self.config.limit * 3:
-            url = self._build_url(start)
+            @self._make_retry()
+            async def _inner():
+                resp = await client.get(url)
+                self._check_response(resp)
+                if resp.status_code != 200:
+                    return False
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "image" not in content_type and not any(
+                    e in content_type for e in ["jpeg", "png", "gif", "webp"]
+                ):
+                    return False
+
+                content = resp.content
+                content_hash = self._hash_content(content)
+
+                async with self._lock:
+                    if content_hash in self._existing_hashes:
+                        print(f"  Skipped (duplicate): {url[:60]}...")
+                        return False
+
+                    if self._downloaded >= self.config.limit:
+                        self._limit_reached.set()
+                        return False
+
+                    ext = self._get_extension(url, content_type)
+                    filename = self._output_path / f"{content_hash}{ext}"
+                    filename.write_bytes(content)
+
+                    self._existing_hashes.add(content_hash)
+                    self._downloaded += 1
+                    print(f"[{self._downloaded}/{self.config.limit}] Saved: {filename.name}")
+
+                    if self._downloaded >= self.config.limit:
+                        self._limit_reached.set()
+
+                    return True
+
             try:
-                resp = self.session.get(url, timeout=self.config.timeout)
-                urls = self._extract_image_urls(resp.text)
+                return await _inner()
+            except Exception as exc:
+                print(f"  Failed: {url[:60]}... -> {exc}")
+                return False
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    async def crawl(self) -> int:
+        """Crawl Google Images asynchronously. Returns the number of
+        images downloaded."""
+        print(f"Starting crawl: '{self.config.keyword}' | limit={self.config.limit}")
+
+        limits = httpx.Limits(
+            max_connections=self.config.max_concurrency,
+            max_keepalive_connections=self.config.max_concurrency,
+        )
+        timeout = httpx.Timeout(self.config.timeout, connect=self.config.timeout)
+
+        async with httpx.AsyncClient(
+            http2=True,
+            limits=limits,
+            timeout=timeout,
+            headers={"User-Agent": self.config.user_agent},
+            follow_redirects=True,
+        ) as client:
+            # Phase 1: collect candidate URLs (sequential pagination)
+            collected_urls: list[str] = []
+            start = 0
+
+            while len(collected_urls) < self.config.limit * 3:
+                html = await self._fetch_search_page(client, start)
+                if html is None:
+                    break
+                urls = self._extract_image_urls(html)
                 if not urls:
                     break
                 for u in urls:
                     if u not in collected_urls:
                         collected_urls.append(u)
                 start += 20
-                time.sleep(self.config.request_delay)
-            except Exception as e:
-                print(f"Error fetching search page: {e}")
-                break
+                await asyncio.sleep(self.config.request_delay)
 
-        print(f"Found {len(collected_urls)} candidate URLs, downloading up to {self.config.limit}...")
-        for url in collected_urls:
-            if self._downloaded >= self.config.limit:
-                break
-            self._download_image(url)
-            time.sleep(self.config.request_delay)
+            print(
+                f"Found {len(collected_urls)} candidate URLs, "
+                f"downloading up to {self.config.limit}..."
+            )
+
+            # Phase 2: download images concurrently
+            semaphore = asyncio.Semaphore(self.config.max_concurrency)
+
+            tasks = [
+                asyncio.create_task(
+                    self._download_image(client, semaphore, url)
+                )
+                for url in collected_urls
+            ]
+
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         print(f"\nDone. Downloaded {self._downloaded} images to '{self.config.output_dir}'")
         return self._downloaded
