@@ -137,6 +137,8 @@ def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
     from tqdm import tqdm
     model.eval()
     all_preds, all_gts = [], []
+    total_start_peaks, total_end_peaks, total_lines = 0, 0, 0
+    hm_max_start, hm_max_end = 0.0, 0.0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="  sAP  ", leave=True,
@@ -146,15 +148,27 @@ def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
 
             for b in range(outputs.shape[0]):
                 pred_np = outputs[b].cpu().numpy()
+                hm_max_start = max(hm_max_start, float(pred_np[0].max()))
+                hm_max_end = max(hm_max_end, float(pred_np[1].max()))
+
                 tx, ty, ts = extract_peaks(pred_np[0], peak_threshold)
                 bx, by, bs = extract_peaks(pred_np[1], peak_threshold)
-                all_preds.append(
-                    pair_endpoints(tx, ty, ts, bx, by, bs, hm_size)
-                )
+                total_start_peaks += len(tx)
+                total_end_peaks += len(bx)
+
+                lines = pair_endpoints(tx, ty, ts, bx, by, bs, hm_size)
+                total_lines += len(lines)
+                all_preds.append(lines)
                 all_gts.append([
                     {"x1": g[0], "y1": g[1], "x2": g[2], "y2": g[3]}
                     for g in batch["gt_lines"][b]
                 ])
+
+    n_imgs = len(all_preds)
+    n_gt = sum(len(g) for g in all_gts)
+    print(f"    heatmap_max: start={hm_max_start:.3f} end={hm_max_end:.3f} | "
+          f"peaks: {total_start_peaks}+{total_end_peaks} | "
+          f"lines: {total_lines} | gt: {n_gt} ({n_imgs} imgs)")
 
     return {f"sAP{t}": compute_sap(all_preds, all_gts, threshold=t) for t in thresholds}
 

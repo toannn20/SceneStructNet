@@ -18,7 +18,7 @@ class Config:
 
     epochs: int = 50
     batch_size: int = 8
-    num_workers: int = 4
+    num_workers: int = 2
     base_lr: float = 2e-4
     backbone_lr: float = 1e-4
     weight_decay: float = 1e-4
