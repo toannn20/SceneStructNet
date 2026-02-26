@@ -1,7 +1,6 @@
 import math
 import numpy as np
 from scipy.ndimage import maximum_filter
-from scipy.optimize import linear_sum_assignment
 
 
 def extract_peaks(heatmap, threshold=0.3, min_distance=3):
@@ -14,7 +13,7 @@ def extract_peaks(heatmap, threshold=0.3, min_distance=3):
 
 
 def pair_endpoints(start_xs, start_ys, start_scores, end_xs, end_ys, end_scores,
-                   hm_size, max_lines=200):
+                   hm_size, max_lines=200, top_k=300):
     lines = []
     for i in range(min(len(start_xs), max_lines)):
         for j in range(min(len(end_xs), max_lines)):
@@ -30,63 +29,118 @@ def pair_endpoints(start_xs, start_ys, start_scores, end_xs, end_ys, end_scores,
                 "score": float(start_scores[i]) * float(end_scores[j]),
             })
     lines.sort(key=lambda x: -x["score"])
-    return lines
+    return lines[:top_k]
 
 
-def _line_distance(pred, gt, img_size=128):
-    s = img_size
-    d1 = (math.sqrt((pred["x1"] - gt["x1"]) ** 2 + (pred["y1"] - gt["y1"]) ** 2) +
-          math.sqrt((pred["x2"] - gt["x2"]) ** 2 + (pred["y2"] - gt["y2"]) ** 2)) * s
-    d2 = (math.sqrt((pred["x1"] - gt["x2"]) ** 2 + (pred["y1"] - gt["y2"]) ** 2) +
-          math.sqrt((pred["x2"] - gt["x1"]) ** 2 + (pred["y2"] - gt["y1"]) ** 2)) * s
-    return min(d1, d2) / 2.0
+def _line_distance(pred, gt, scale=128.0):
+    """Squared endpoint distance with min over both orderings (matches LINEA).
+    
+    Coordinates are scaled from [0,1] to [0, scale] before computing distance,
+    so thresholds (5, 10, 15) are in the scaled pixel space.
+    """
+    px1, py1 = pred["x1"] * scale, pred["y1"] * scale
+    px2, py2 = pred["x2"] * scale, pred["y2"] * scale
+    gx1, gy1 = gt["x1"] * scale, gt["y1"] * scale
+    gx2, gy2 = gt["x2"] * scale, gt["y2"] * scale
+
+    d1 = (px1 - gx1) ** 2 + (py1 - gy1) ** 2 + (px2 - gx2) ** 2 + (py2 - gy2) ** 2
+    d2 = (px1 - gx2) ** 2 + (py1 - gy2) ** 2 + (px2 - gx1) ** 2 + (py2 - gy1) ** 2
+    return min(d1, d2)
 
 
-def compute_sap(all_preds, all_gts, threshold, img_size=128):
-    tp_list, fp_list, scores_list = [], [], []
-    total_gt = 0
+def _greedy_matching(preds, gts, threshold):
+    """Greedy TP/FP assignment in score-sorted order (matches LINEA's msTPFP).
+
+    For each pred (already score-sorted), find the closest GT.
+    If distance < threshold and that GT hasn't been matched yet, it's a TP.
+    """
+    n_pred = len(preds)
+    tp = np.zeros(n_pred)
+    fp = np.zeros(n_pred)
+
+    if not gts:
+        fp[:] = 1
+        return tp, fp
+
+    # Precompute distance matrix and find closest GT for each pred
+    n_gt = len(gts)
+    dist_matrix = np.array([[_line_distance(p, g) for g in gts] for p in preds])
+    closest_gt = np.argmin(dist_matrix, axis=1)
+    closest_dist = dist_matrix[np.arange(n_pred), closest_gt]
+
+    hit = np.zeros(n_gt, dtype=bool)
+    for i in range(n_pred):
+        if closest_dist[i] < threshold and not hit[closest_gt[i]]:
+            hit[closest_gt[i]] = True
+            tp[i] = 1
+        else:
+            fp[i] = 1
+
+    return tp, fp
+
+
+def _compute_ap(tp, fp):
+    """VOC-style AP with envelope precision (matches LINEA's ap method)."""
+    recall = tp.copy()
+    precision = tp / np.maximum(tp + fp, 1e-9)
+
+    # Prepend (0,0) and append (1,0) sentinels
+    recall = np.concatenate([[0.0], recall, [1.0]])
+    precision = np.concatenate([[0.0], precision, [0.0]])
+
+    # Make precision monotonically decreasing (envelope)
+    for i in range(len(precision) - 1, 0, -1):
+        precision[i - 1] = max(precision[i - 1], precision[i])
+
+    # Sum rectangular areas where recall changes
+    idx = np.where(recall[1:] != recall[:-1])[0]
+    ap = np.sum((recall[idx + 1] - recall[idx]) * precision[idx + 1])
+    return float(ap)
+
+
+def compute_sap(all_preds, all_gts, threshold):
+    """Compute structural AP at a given threshold (matches LINEA evaluation)."""
+    all_tp, all_fp, all_scores = [], [], []
+    n_gt_total = 0
 
     for preds, gts in zip(all_preds, all_gts):
-        total_gt += len(gts)
+        n_gt_total += len(gts)
         if not preds:
             continue
-        if not gts:
-            for p in preds:
-                tp_list.append(0); fp_list.append(1); scores_list.append(p["score"])
-            continue
 
-        cost = np.array([[_line_distance(p, g, img_size) for g in gts] for p in preds])
-        row_ind, col_ind = linear_sum_assignment(cost)
-        matched = {r for r, c in zip(row_ind, col_ind) if cost[r, c] <= threshold}
+        # preds are already sorted by score (from pair_endpoints)
+        scores = np.array([p["score"] for p in preds])
+        tp, fp = _greedy_matching(preds, gts, threshold)
 
-        for i, p in enumerate(preds):
-            scores_list.append(p["score"])
-            tp_list.append(1 if i in matched else 0)
-            fp_list.append(0 if i in matched else 1)
+        all_scores.append(scores)
+        all_tp.append(tp)
+        all_fp.append(fp)
 
-    if not total_gt or not scores_list:
+    if n_gt_total == 0 or not all_scores:
         return 0.0
 
-    order = np.argsort(-np.array(scores_list))
-    tp_cs = np.cumsum(np.array(tp_list)[order])
-    fp_cs = np.cumsum(np.array(fp_list)[order])
-    precision = tp_cs / (tp_cs + fp_cs + 1e-6)
-    recall = tp_cs / (total_gt + 1e-6)
+    # Concatenate across all images and sort globally by score
+    scores = np.concatenate(all_scores)
+    tp = np.concatenate(all_tp)
+    fp = np.concatenate(all_fp)
 
-    return float(np.trapezoid(
-        np.concatenate([[1], precision]),
-        np.concatenate([[0], recall])
-    )) * 100.0
+    order = np.argsort(-scores)
+    tp_cum = np.cumsum(tp[order]) / n_gt_total
+    fp_cum = np.cumsum(fp[order]) / n_gt_total
+
+    return _compute_ap(tp_cum, fp_cum) * 100.0
 
 
 def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
                       peak_threshold=0.3):
     import torch
+    from tqdm import tqdm
     model.eval()
     all_preds, all_gts = [], []
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="  sAP  ", leave=True,
+                          bar_format="{l_bar}{bar:25}{r_bar}"):
             outputs = model(batch["image"].to(device))
             hm_size = outputs.shape[-1]
 
@@ -103,3 +157,4 @@ def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
                 ])
 
     return {f"sAP{t}": compute_sap(all_preds, all_gts, threshold=t) for t in thresholds}
+
