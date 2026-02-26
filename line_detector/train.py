@@ -1,10 +1,10 @@
 import argparse
 import json
-import time
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from config import cfg
 from data.dataset import VerticalLineDataset, collate_fn
@@ -50,8 +50,9 @@ def build_loaders(data_dir, images_dir, batch_size):
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
     model.train()
     accum = {}
-    t0 = time.time()
-    for i, batch in enumerate(loader):
+    pbar = tqdm(loader, desc=f"  Train", leave=True,
+                bar_format="{l_bar}{bar:25}{r_bar}")
+    for i, batch in enumerate(pbar):
         pred = model(batch["image"].to(device))
         losses = criterion(pred, batch["heatmaps"].to(device))
 
@@ -63,13 +64,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
         for k, v in losses.items():
             accum[k] = accum.get(k, 0.0) + v.item()
 
-        if (i + 1) % 20 == 0 or (i + 1) == len(loader):
-            n = i + 1
-            print(f"  [{epoch}][{n}/{len(loader)}] "
-                  f"loss={accum['total']/n:.4f} "
-                  f"cls={accum['loss_class']/n:.4f} "
-                  f"seg={accum['loss_seg']/n:.4f} "
-                  f"({time.time()-t0:.1f}s)")
+        n = i + 1
+        pbar.set_postfix_str(f"L={accum['total']/n:.0f}")
 
     return {k: v / len(loader) for k, v in accum.items()}
 
@@ -78,11 +74,32 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 def validate(model, loader, criterion, device):
     model.eval()
     accum = {}
-    for batch in loader:
+    for batch in tqdm(loader, desc="  Val  ", leave=True,
+                      bar_format="{l_bar}{bar:25}{r_bar}"):
         for k, v in criterion(model(batch["image"].to(device)),
                               batch["heatmaps"].to(device)).items():
             accum[k] = accum.get(k, 0.0) + v.item()
     return {k: v / len(loader) for k, v in accum.items()}
+
+
+def print_epoch_summary(epoch, train_m, val_m, sap, lr, best_val_loss, is_best):
+    print(f"\n  {'─' * 52}")
+    print(f"  Epoch {epoch} Summary")
+    print(f"  {'─' * 52}")
+    print(f"  {'':12s} {'Train':>12s} {'Val':>12s}")
+    print(f"  {'loss':12s} {train_m['total']:12.2f} {val_m['total']:12.2f}")
+    print(f"  {'cls_loss':12s} {train_m['loss_class']:12.2f} {val_m['loss_class']:12.2f}")
+    print(f"  {'seg_loss':12s} {train_m['loss_seg']:12.2f} {val_m['loss_seg']:12.2f}")
+    print(f"  {'start_loss':12s} {train_m['loss_top']:12.2f} {val_m['loss_top']:12.2f}")
+    print(f"  {'end_loss':12s} {train_m['loss_bot']:12.2f} {val_m['loss_bot']:12.2f}")
+    print(f"  {'line_loss':12s} {train_m['loss_line']:12.2f} {val_m['loss_line']:12.2f}")
+    print(f"  {'─' * 52}")
+    if sap:
+        sap_str = " | ".join(f"{k}={v:.1f}" for k, v in sap.items())
+        print(f"  sAP: {sap_str}")
+    print(f"  lr={lr:.2e} | best_val_loss={best_val_loss:.2f}"
+          f"{' ✓ NEW BEST' if is_best else ''}")
+    print(f"  {'─' * 52}\n")
 
 
 def main():
@@ -128,6 +145,7 @@ def main():
         scheduler.step()
 
         val_loss = val_m["total"]
+        is_best = val_loss < best_val_loss
         row = {"epoch": epoch, "train": train_m, "val": val_m}
         history.append(row)
 
@@ -137,28 +155,27 @@ def main():
 
         torch.save(ckpt, cfg.last_model_path)
 
-        if val_loss < best_val_loss:
+        if is_best:
             best_val_loss = val_loss
             ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, cfg.best_model_path)
-            print(f"  ✓ Best model saved (val_loss={val_loss:.4f})")
-        else:
-            print(f"  val_loss={val_loss:.4f} (best={best_val_loss:.4f})")
 
-        if epoch % 10 == 0:
-            sap = evaluate_heatmaps(model, val_loader, device, cfg.sap_thresholds,
-                                    cfg.peak_threshold)
-            print(f"  sAP5={sap['sAP5']:.1f} sAP10={sap['sAP10']:.1f} sAP15={sap['sAP15']:.1f}")
-            row["sap"] = sap
+        # sAP evaluation every epoch
+        sap = evaluate_heatmaps(model, val_loader, device, cfg.sap_thresholds,
+                                cfg.peak_threshold)
+        row["sap"] = sap
+
+        # Current learning rate
+        lr = optimizer.param_groups[-1]["lr"]
+
+        print_epoch_summary(epoch, train_m, val_m, sap, lr, best_val_loss, is_best)
 
         with open(f"{cfg.checkpoint_dir}/history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-    print("\nFinal evaluation:")
-    sap = evaluate_heatmaps(model, val_loader, device, cfg.sap_thresholds,
-                            cfg.peak_threshold)
-    print(f"sAP5={sap['sAP5']:.1f} | sAP10={sap['sAP10']:.1f} | sAP15={sap['sAP15']:.1f}")
+    print("Training complete!")
 
 
 if __name__ == "__main__":
     main()
+
