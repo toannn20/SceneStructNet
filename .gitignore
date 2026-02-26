@@ -84,8 +84,15 @@ docs/generated/
 *.log
 logs/
 
-# --- Raw Data ---
+# --- Raw Data & Data for training/eval ---
 raw_datasets/
+dataset/
 
 # Cookies
 cookies.txt
+
+# checkpoints
+checkpoints/
+
+# Evaluation results
+eval_vis/
