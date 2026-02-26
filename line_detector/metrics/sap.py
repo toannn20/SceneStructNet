@@ -53,6 +53,7 @@ def _greedy_matching(preds, gts, threshold):
 
     For each pred (already score-sorted), find the closest GT.
     If distance < threshold and that GT hasn't been matched yet, it's a TP.
+    Returns tp, fp arrays and the minimum distance found.
     """
     n_pred = len(preds)
     tp = np.zeros(n_pred)
@@ -60,13 +61,14 @@ def _greedy_matching(preds, gts, threshold):
 
     if not gts:
         fp[:] = 1
-        return tp, fp
+        return tp, fp, float("inf")
 
     # Precompute distance matrix and find closest GT for each pred
     n_gt = len(gts)
     dist_matrix = np.array([[_line_distance(p, g) for g in gts] for p in preds])
     closest_gt = np.argmin(dist_matrix, axis=1)
     closest_dist = dist_matrix[np.arange(n_pred), closest_gt]
+    min_dist = float(closest_dist.min()) if len(closest_dist) > 0 else float("inf")
 
     hit = np.zeros(n_gt, dtype=bool)
     for i in range(n_pred):
@@ -76,7 +78,7 @@ def _greedy_matching(preds, gts, threshold):
         else:
             fp[i] = 1
 
-    return tp, fp
+    return tp, fp, min_dist
 
 
 def _compute_ap(tp, fp):
@@ -102,6 +104,7 @@ def compute_sap(all_preds, all_gts, threshold):
     """Compute structural AP at a given threshold (matches LINEA evaluation)."""
     all_tp, all_fp, all_scores = [], [], []
     n_gt_total = 0
+    min_dist_overall = float("inf")
 
     for preds, gts in zip(all_preds, all_gts):
         n_gt_total += len(gts)
@@ -110,14 +113,17 @@ def compute_sap(all_preds, all_gts, threshold):
 
         # preds are already sorted by score (from pair_endpoints)
         scores = np.array([p["score"] for p in preds])
-        tp, fp = _greedy_matching(preds, gts, threshold)
+        tp, fp, min_dist = _greedy_matching(preds, gts, threshold)
+
+        if min_dist < min_dist_overall:
+            min_dist_overall = min_dist
 
         all_scores.append(scores)
         all_tp.append(tp)
         all_fp.append(fp)
 
     if n_gt_total == 0 or not all_scores:
-        return 0.0
+        return 0.0, min_dist_overall
 
     # Concatenate across all images and sort globally by score
     scores = np.concatenate(all_scores)
@@ -128,7 +134,7 @@ def compute_sap(all_preds, all_gts, threshold):
     tp_cum = np.cumsum(tp[order]) / n_gt_total
     fp_cum = np.cumsum(fp[order]) / n_gt_total
 
-    return _compute_ap(tp_cum, fp_cum) * 100.0
+    return _compute_ap(tp_cum, fp_cum) * 100.0, min_dist_overall
 
 
 def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
@@ -170,5 +176,11 @@ def evaluate_heatmaps(model, dataloader, device, thresholds=(5, 10, 15),
           f"peaks: {total_start_peaks}+{total_end_peaks} | "
           f"lines: {total_lines} | gt: {n_gt} ({n_imgs} imgs)")
 
-    return {f"sAP{t}": compute_sap(all_preds, all_gts, threshold=t) for t in thresholds}
+    results = {}
+    for t in thresholds:
+        sap_val, min_dist = compute_sap(all_preds, all_gts, threshold=t)
+        results[f"sAP{t}"] = sap_val
+        print(f"    sAP{t}: {sap_val:.1f}  (min_dist={min_dist:.2f}, threshold={t})")
+
+    return results
 
