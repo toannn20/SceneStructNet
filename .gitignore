@@ -85,7 +85,7 @@ docs/generated/
 logs/
 
 # --- Raw Data & Data for training/eval ---
-raw_datasets/
+raw_images/
 dataset/
 
 # Cookies
